@@ -31,8 +31,7 @@
 #define BINANCE_PATH "/ws/btcusdt@ticker"  // 24小时价格统计
 #define BUFFER_SIZE 4096
 #define MAX_RESPONSE_SIZE 1024
-#define PING_INTERVAL_SEC 60  // 心跳间隔60秒（减少频率）
-#define ENABLE_PING 0  // 0=禁用ping，1=启用ping
+#define PING_INTERVAL_SEC 30  // 心跳间隔30秒
 
 // 全局控制变量
 static volatile int g_running = 1;
@@ -72,6 +71,7 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     
     // 处理pong帧(opcode=10)
     if (opcode == 10 && fin) {
+        printf("收到心跳pong响应\n");
         return 2;  // 返回特殊值表示pong帧
     }
     
@@ -108,61 +108,19 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     return header_len + actual_len;
 }
 
-// 发送WebSocket ping帧 (客户端需要mask)
+// 发送WebSocket ping帧
 int send_websocket_ping(mbedtls_ssl_context *ssl) {
-    unsigned char ping_frame[6];
-    unsigned char mask_key[4] = {0x12, 0x34, 0x56, 0x78};
-    
+    unsigned char ping_frame[2];
     ping_frame[0] = 0x89;  // FIN=1, opcode=9 (ping)
-    ping_frame[1] = 0x80;  // MASK=1, payload length=0
-    ping_frame[2] = mask_key[0];
-    ping_frame[3] = mask_key[1]; 
-    ping_frame[4] = mask_key[2];
-    ping_frame[5] = mask_key[3];
+    ping_frame[1] = 0x00;  // 无payload，无mask
     
-    int ret = mbedtls_ssl_write(ssl, ping_frame, 6);
+    int ret = mbedtls_ssl_write(ssl, ping_frame, 2);
     if (ret <= 0) {
-        char error_buf[100];
-        mbedtls_strerror(ret, error_buf, sizeof(error_buf));
-        printf("发送ping帧失败: %d (%s)\n", ret, error_buf);
+        printf("发送ping帧失败: %d\n", ret);
         return -1;
     }
     
-    printf("已发送心跳ping (masked, 时间: %ld)\n", time(NULL));
-    return 0;
-}
-
-// 备用保活方法：发送订阅消息
-int send_keepalive_subscribe(mbedtls_ssl_context *ssl) {
-    const char *subscribe_msg = "{\"method\":\"SUBSCRIBE\",\"params\":[\"btcusdt@ticker\"],\"id\":1}";
-    int msg_len = strlen(subscribe_msg);
-    
-    // 构建WebSocket文本帧 (带mask)
-    unsigned char frame[256];
-    unsigned char mask_key[4] = {0xAB, 0xCD, 0xEF, 0x12};
-    int frame_len = 0;
-    
-    frame[0] = 0x81;  // FIN=1, opcode=1 (text)
-    frame[1] = 0x80 | (msg_len & 0x7F);  // MASK=1, length
-    frame_len = 2;
-    
-    // 添加mask key
-    memcpy(frame + frame_len, mask_key, 4);
-    frame_len += 4;
-    
-    // 添加masked payload
-    for (int i = 0; i < msg_len; i++) {
-        frame[frame_len + i] = subscribe_msg[i] ^ mask_key[i % 4];
-    }
-    frame_len += msg_len;
-    
-    int ret = mbedtls_ssl_write(ssl, frame, frame_len);
-    if (ret <= 0) {
-        printf("发送保活订阅失败: %d\n", ret);
-        return -1;
-    }
-    
-    printf("已发送保活订阅消息 (时间: %ld)\n", time(NULL));
+    printf("已发送心跳ping\n");
     return 0;
 }
 
@@ -462,30 +420,19 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     struct pollfd fds[1];
     int ret;
     int data_received = 0;
-    int ping_sent = 0;
-    int pong_received = 0;
     time_t last_ping_time = time(NULL);
-    time_t connection_start = time(NULL);
     
     printf("开始接收行情数据...\n");
-    if (ENABLE_PING) {
-        printf("心跳已启用，间隔: %d秒\n", PING_INTERVAL_SEC);
-    } else {
-        printf("心跳已禁用，依赖数据流保活\n");
-    }
     
     fds[0].fd = sockfd;
     fds[0].events = POLLIN;
     
     while (g_running) {
         // 检查是否需要发送心跳
-        if (ENABLE_PING) {
-            time_t current_time = time(NULL);
-            if (current_time - last_ping_time >= PING_INTERVAL_SEC) {
-                if (send_websocket_ping(ssl) == 0) {
-                    last_ping_time = current_time;
-                    ping_sent++;
-                }
+        time_t current_time = time(NULL);
+        if (current_time - last_ping_time >= PING_INTERVAL_SEC) {
+            if (send_websocket_ping(ssl) == 0) {
+                last_ping_time = current_time;
             }
         }
         
@@ -518,15 +465,7 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
                 } else if (ret == MBEDTLS_ERR_NET_CONN_RESET) {
                     printf("网络连接被重置\n");
                 }
-                time_t connection_duration = time(NULL) - connection_start;
-                printf("连接统计信息:\n");
-                printf("  连接持续时间: %ld 秒\n", connection_duration);
-                printf("  已接收数据包: %d\n", data_received);
-                printf("  已发送ping: %d\n", ping_sent);
-                printf("  已收到pong: %d\n", pong_received);
-                if (ping_sent > 0) {
-                    printf("  心跳响应率: %.1f%%\n", (float)pong_received * 100.0 / ping_sent);
-                }
+                printf("已接收数据包数量: %d\n", data_received);
                 break;
             }
             
@@ -540,9 +479,7 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
             if (frame_len > 0) {
                 process_ticker_data(payload, payload_len);
             } else if (frame_len == 2) {
-                // 收到pong响应
-                pong_received++;
-                printf("收到心跳pong响应 (#%d)\n", pong_received);
+                // pong帧已在parse_websocket_frame中处理
             }
         }
         

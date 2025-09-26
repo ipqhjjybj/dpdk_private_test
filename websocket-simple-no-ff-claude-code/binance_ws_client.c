@@ -31,8 +31,9 @@
 #define BINANCE_PATH "/ws/btcusdt@ticker"  // 24小时价格统计
 #define BUFFER_SIZE 4096
 #define MAX_RESPONSE_SIZE 1024
-#define PING_INTERVAL_SEC 60  // 心跳间隔60秒（减少频率）
-#define ENABLE_PING 0  // 0=禁用ping，1=启用ping
+#define PING_INTERVAL_SEC 30  // 心跳间隔30秒（符合币安频率限制）
+#define ENABLE_PING 1  // 0=禁用ping，1=启用ping
+#define MAX_MESSAGES_PER_SEC 5  // 币安限制：每秒最多5个消息
 
 // 全局控制变量
 static volatile int g_running = 1;
@@ -70,8 +71,10 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     int masked = (second_byte >> 7) & 1;
     int len_field = second_byte & 0x7F;
     
-    // 处理pong帧(opcode=10)
-    if (opcode == 10 && fin) {
+    // 处理pong帧(opcode=10, 0xA)
+    if (opcode == 0xA && fin) {
+        printf("检测到pong帧: opcode=0x%X, fin=%d, masked=%d\n", opcode, fin, masked);
+        printf("pong帧即将返回2\n");
         return 2;  // 返回特殊值表示pong帧
     }
     
@@ -108,12 +111,18 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     return header_len + actual_len;
 }
 
-// 发送WebSocket ping帧 (客户端需要mask)
+// 发送WebSocket ping帧 (客户端需要mask，币安兼容)
 int send_websocket_ping(mbedtls_ssl_context *ssl) {
     unsigned char ping_frame[6];
-    unsigned char mask_key[4] = {0x12, 0x34, 0x56, 0x78};
     
-    ping_frame[0] = 0x89;  // FIN=1, opcode=9 (ping)
+    // 生成随机mask key
+    srand(time(NULL));
+    unsigned char mask_key[4];
+    for (int i = 0; i < 4; i++) {
+        mask_key[i] = rand() & 0xFF;
+    }
+    
+    ping_frame[0] = 0x89;  // FIN=1, RSV=000, opcode=9 (ping)
     ping_frame[1] = 0x80;  // MASK=1, payload length=0
     ping_frame[2] = mask_key[0];
     ping_frame[3] = mask_key[1]; 
@@ -121,14 +130,14 @@ int send_websocket_ping(mbedtls_ssl_context *ssl) {
     ping_frame[5] = mask_key[3];
     
     int ret = mbedtls_ssl_write(ssl, ping_frame, 6);
-    if (ret <= 0) {
+    if (ret != 6) {
         char error_buf[100];
         mbedtls_strerror(ret, error_buf, sizeof(error_buf));
-        printf("发送ping帧失败: %d (%s)\n", ret, error_buf);
+        printf("发送ping帧失败: 发送了%d字节，期望6字节 (%s)\n", ret, error_buf);
         return -1;
     }
     
-    printf("已发送心跳ping (masked, 时间: %ld)\n", time(NULL));
+    printf("已发送币安ping帧 (时间: %ld)\n", time(NULL));
     return 0;
 }
 
@@ -467,6 +476,10 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     time_t last_ping_time = time(NULL);
     time_t connection_start = time(NULL);
     
+    // 消息频率限制 (币安要求每秒最多5个消息)
+    time_t rate_limit_window = time(NULL);
+    int messages_in_window = 0;
+    
     printf("开始接收行情数据...\n");
     if (ENABLE_PING) {
         printf("心跳已启用，间隔: %d秒\n", PING_INTERVAL_SEC);
@@ -478,13 +491,26 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     fds[0].events = POLLIN;
     
     while (g_running) {
+        // 检查消息频率限制窗口
+        time_t current_time = time(NULL);
+        if (current_time > rate_limit_window) {
+            rate_limit_window = current_time;
+            messages_in_window = 0;
+        }
+        
         // 检查是否需要发送心跳
         if (ENABLE_PING) {
-            time_t current_time = time(NULL);
             if (current_time - last_ping_time >= PING_INTERVAL_SEC) {
-                if (send_websocket_ping(ssl) == 0) {
-                    last_ping_time = current_time;
-                    ping_sent++;
+                // 检查频率限制
+                if (messages_in_window < MAX_MESSAGES_PER_SEC) {
+                    if (send_websocket_ping(ssl) == 0) {
+                        last_ping_time = current_time;
+                        ping_sent++;
+                        messages_in_window++;
+                        printf("消息频率: %d/%d (当前秒: %ld)\n", messages_in_window, MAX_MESSAGES_PER_SEC, current_time);
+                    }
+                } else {
+                    printf("达到频率限制，跳过ping发送 (%d/%d)\n", messages_in_window, MAX_MESSAGES_PER_SEC);
                 }
             }
         }
@@ -530,19 +556,25 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
                 break;
             }
             
-            data_received++;
-            
             // 解析WebSocket帧
             unsigned char *payload;
             int payload_len;
+            printf("开始解析帧，缓冲区大小: %d字节\n", ret);
             int frame_len = parse_websocket_frame(buffer, ret, &payload, &payload_len);
+            printf("帧解析完成，返回值: %d\n", frame_len);
             
-            if (frame_len > 0) {
-                process_ticker_data(payload, payload_len);
-            } else if (frame_len == 2) {
-                // 收到pong响应
+            if (frame_len == 2) {
+                // 收到pong响应 - 优先处理
                 pong_received++;
-                printf("收到心跳pong响应 (#%d)\n", pong_received);
+                printf("收到心跳pong响应 (#%d) - 统计已更新\n", pong_received);
+            } else if (frame_len > 0) {
+                // 正常数据帧
+                data_received++;
+                process_ticker_data(payload, payload_len);
+            } else {
+                // 其他类型的帧或解析失败
+                data_received++;
+                printf("收到其他类型帧: frame_len=%d\n", frame_len);
             }
         }
         

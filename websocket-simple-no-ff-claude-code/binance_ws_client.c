@@ -28,8 +28,8 @@
 // 币安WebSocket配置
 #define BINANCE_HOST "stream.binance.com"
 #define BINANCE_PORT 9443
-#define BINANCE_PATH "/ws/btcusdt@ticker"  // 24小时价格统计
-#define BUFFER_SIZE 4096
+#define BINANCE_PATH "/ws/btcusdt@depth"  // 订单簿深度数据
+#define BUFFER_SIZE 16384  // 增加到16KB处理大的深度数据
 #define MAX_RESPONSE_SIZE 1024
 #define PING_INTERVAL_SEC 30  // 心跳间隔30秒（符合币安频率限制）
 #define ENABLE_PING 1  // 0=禁用ping，1=启用ping
@@ -59,6 +59,7 @@ void signal_handler(int sig) {
 int parse_websocket_frame(const unsigned char *buffer, int len, 
                          unsigned char **payload, int *payload_len) {
     if (len < 2) {
+        printf("帧太短: %d字节\n", len);
         return -1;
     }
     
@@ -71,15 +72,17 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     int masked = (second_byte >> 7) & 1;
     int len_field = second_byte & 0x7F;
     
+    printf("帧调试: fin=%d, opcode=0x%X, masked=%d, len_field=%d\n", fin, opcode, masked, len_field);
+    
     // 处理pong帧(opcode=10, 0xA)
     if (opcode == 0xA && fin) {
         printf("检测到pong帧: opcode=0x%X, fin=%d, masked=%d\n", opcode, fin, masked);
-        printf("pong帧即将返回2\n");
         return 2;  // 返回特殊值表示pong帧
     }
     
-    // 只处理文本帧(opcode=1)和完整帧(fin=1)
-    if (opcode != 1 || !fin) {
+    // 处理文本帧(opcode=1) - 移除fin检查，允许分片
+    if (opcode != 1) {
+        printf("不支持的opcode: 0x%X\n", opcode);
         return -1;
     }
     
@@ -88,12 +91,22 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     
     // 处理扩展长度
     if (len_field == 126) {
-        if (len < 4) return -1;
+        if (len < 4) {
+            printf("扩展长度帧不完整: 需要4字节，实际%d字节\n", len);
+            return -1;
+        }
         actual_len = (buffer[2] << 8) | buffer[3];
         header_len += 2;
+        printf("扩展长度(126): %d字节\n", actual_len);
     } else if (len_field == 127) {
-        // 忽略超长帧
-        return -1;
+        if (len < 10) {
+            printf("超长帧不完整: 需要10字节，实际%d字节\n", len);
+            return -1;
+        }
+        // 读取64位长度（只取低32位）
+        actual_len = (buffer[6] << 24) | (buffer[7] << 16) | (buffer[8] << 8) | buffer[9];
+        header_len += 8;
+        printf("超长帧(127): %d字节\n", actual_len);
     }
     
     // 处理掩码（服务器发送的帧通常不带掩码）
@@ -102,8 +115,11 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     }
     
     if (len < header_len + actual_len) {
+        printf("帧数据不完整: 需要%d字节，实际%d字节\n", header_len + actual_len, len);
         return -1;  // 数据不完整
     }
+    
+    printf("成功解析帧: header=%d字节, payload=%d字节\n", header_len, actual_len);
     
     *payload = (unsigned char *)buffer + header_len;
     *payload_len = actual_len;
@@ -138,6 +154,40 @@ int send_websocket_ping(mbedtls_ssl_context *ssl) {
     }
     
     printf("已发送币安ping帧 (时间: %ld)\n", time(NULL));
+    return 0;
+}
+
+// 备用保活方法：发送订阅消息
+int send_keepalive_subscribe(mbedtls_ssl_context *ssl) {
+    const char *subscribe_msg = "{\"method\":\"SUBSCRIBE\",\"params\":[\"btcusdt@depth\"],\"id\":1}";
+    int msg_len = strlen(subscribe_msg);
+    
+    // 构建WebSocket文本帧 (带mask)
+    unsigned char frame[256];
+    unsigned char mask_key[4] = {0xAB, 0xCD, 0xEF, 0x12};
+    int frame_len = 0;
+    
+    frame[0] = 0x81;  // FIN=1, opcode=1 (text)
+    frame[1] = 0x80 | (msg_len & 0x7F);  // MASK=1, length
+    frame_len = 2;
+    
+    // 添加mask key
+    memcpy(frame + frame_len, mask_key, 4);
+    frame_len += 4;
+    
+    // 添加masked payload
+    for (int i = 0; i < msg_len; i++) {
+        frame[frame_len + i] = subscribe_msg[i] ^ mask_key[i % 4];
+    }
+    frame_len += msg_len;
+    
+    int ret = mbedtls_ssl_write(ssl, frame, frame_len);
+    if (ret <= 0) {
+        printf("发送保活订阅失败: %d\n", ret);
+        return -1;
+    }
+    
+    printf("已发送保活订阅消息 (时间: %ld)\n", time(NULL));
     return 0;
 }
 
@@ -185,8 +235,8 @@ long long parse_json_number(const char *json_str, const char *field) {
     return result;
 }
 
-// 解析币安行情数据（简化版JSON解析）
-void process_ticker_data(const unsigned char *data, int len) {
+// 解析币安订单簿深度数据（简化版JSON解析）
+void process_depth_data(const unsigned char *data, int len) {
     // 创建以null结尾的字符串
     char *json_str = (char*)malloc(len + 1);
     if (!json_str) return;
@@ -205,13 +255,13 @@ void process_ticker_data(const unsigned char *data, int len) {
     long long latency_us = current_time_us - (server_time * 1000);
     long long latency_ms = latency_us / 1000;
     
-    // 简单解析关键字段
+    // 简单解析深度数据关键字段
     char *symbol = strstr(json_str, "\"s\":\"");
-    char *price = strstr(json_str, "\"c\":\"");
-    char *change = strstr(json_str, "\"P\":\"");
-    char *volume = strstr(json_str, "\"v\":\"");
+    char *last_update_id = strstr(json_str, "\"lastUpdateId\":");
+    char *bids = strstr(json_str, "\"bids\":");
+    char *asks = strstr(json_str, "\"asks\":");
     
-    printf("\n=== 币安行情数据 ===\n");
+    printf("\n=== 币安深度数据 ===\n");
     
     // 解析交易对
     if (symbol) {
@@ -224,38 +274,28 @@ void process_ticker_data(const unsigned char *data, int len) {
         }
     }
     
-    // 解析当前价格
-    if (price) {
-        price += 5;  // 跳过 "c":"
-        char *end = strchr(price, '"');
+    // 解析最后更新ID
+    if (last_update_id) {
+        last_update_id += 15;  // 跳过 "lastUpdateId":
+        char *end = strpbrk(last_update_id, ",}");
         if (end) {
+            char saved = *end;
             *end = '\0';
-            printf("当前价格: %s USDT\n", price);
-            *end = '"';
+            printf("最后更新ID: %s\n", last_update_id);
+            *end = saved;
         }
     }
     
-    // 解析24小时涨跌幅
-    if (change) {
-        change += 5;  // 跳过 "P":"
-        char *end = strchr(change, '"');
-        if (end) {
-            *end = '\0';
-            printf("24h涨跌幅: %s%%\n", change);
-            *end = '"';
-        }
+    // 显示买单和卖单信息
+    if (bids) {
+        printf("买单数据: 可用\n");
+    }
+    if (asks) {
+        printf("卖单数据: 可用\n");
     }
     
-    // 解析24小时成交量
-    if (volume) {
-        volume += 5;  // 跳过 "v":"
-        char *end = strchr(volume, '"');
-        if (end) {
-            *end = '\0';
-            printf("24h成交量: %s BTC\n", volume);
-            *end = '"';
-        }
-    }
+    // 显示原始数据长度（深度数据通常较大）
+    printf("数据长度: %d 字节\n", len);
     
     // 显示延迟信息
     printf("服务器时间: %lld ms\n", server_time);
@@ -536,7 +576,7 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
             } else if (frame_len > 0) {
                 // 正常数据帧
                 data_received++;
-                process_ticker_data(payload, payload_len);
+                process_depth_data(payload, payload_len);
             } else {
                 // 其他类型的帧或解析失败
                 data_received++;

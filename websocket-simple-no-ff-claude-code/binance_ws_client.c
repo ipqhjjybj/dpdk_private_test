@@ -141,40 +141,6 @@ int send_websocket_ping(mbedtls_ssl_context *ssl) {
     return 0;
 }
 
-// 备用保活方法：发送订阅消息
-int send_keepalive_subscribe(mbedtls_ssl_context *ssl) {
-    const char *subscribe_msg = "{\"method\":\"SUBSCRIBE\",\"params\":[\"btcusdt@ticker\"],\"id\":1}";
-    int msg_len = strlen(subscribe_msg);
-    
-    // 构建WebSocket文本帧 (带mask)
-    unsigned char frame[256];
-    unsigned char mask_key[4] = {0xAB, 0xCD, 0xEF, 0x12};
-    int frame_len = 0;
-    
-    frame[0] = 0x81;  // FIN=1, opcode=1 (text)
-    frame[1] = 0x80 | (msg_len & 0x7F);  // MASK=1, length
-    frame_len = 2;
-    
-    // 添加mask key
-    memcpy(frame + frame_len, mask_key, 4);
-    frame_len += 4;
-    
-    // 添加masked payload
-    for (int i = 0; i < msg_len; i++) {
-        frame[frame_len + i] = subscribe_msg[i] ^ mask_key[i % 4];
-    }
-    frame_len += msg_len;
-    
-    int ret = mbedtls_ssl_write(ssl, frame, frame_len);
-    if (ret <= 0) {
-        printf("发送保活订阅失败: %d\n", ret);
-        return -1;
-    }
-    
-    printf("已发送保活订阅消息 (时间: %ld)\n", time(NULL));
-    return 0;
-}
-
 // 获取当前时间戳（微秒）
 long long get_current_timestamp_us() {
     struct timeval tv;

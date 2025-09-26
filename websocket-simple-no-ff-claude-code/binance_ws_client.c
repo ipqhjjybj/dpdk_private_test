@@ -31,6 +31,7 @@
 #define BINANCE_PATH "/ws/btcusdt@ticker"  // 24小时价格统计
 #define BUFFER_SIZE 4096
 #define MAX_RESPONSE_SIZE 1024
+#define PING_INTERVAL_SEC 30  // 心跳间隔30秒
 
 // 全局控制变量
 static volatile int g_running = 1;
@@ -52,7 +53,7 @@ void signal_handler(int sig) {
     g_running = 0;
 }
 
-// 简化的WebSocket帧解析（仅处理文本帧）
+// 简化的WebSocket帧解析（处理文本帧和pong帧）
 int parse_websocket_frame(const unsigned char *buffer, int len, 
                          unsigned char **payload, int *payload_len) {
     if (len < 2) {
@@ -67,6 +68,12 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     int opcode = first_byte & 0x0F;
     int masked = (second_byte >> 7) & 1;
     int len_field = second_byte & 0x7F;
+    
+    // 处理pong帧(opcode=10)
+    if (opcode == 10 && fin) {
+        printf("收到心跳pong响应\n");
+        return 2;  // 返回特殊值表示pong帧
+    }
     
     // 只处理文本帧(opcode=1)和完整帧(fin=1)
     if (opcode != 1 || !fin) {
@@ -99,6 +106,22 @@ int parse_websocket_frame(const unsigned char *buffer, int len,
     *payload_len = actual_len;
     
     return header_len + actual_len;
+}
+
+// 发送WebSocket ping帧
+int send_websocket_ping(mbedtls_ssl_context *ssl) {
+    unsigned char ping_frame[2];
+    ping_frame[0] = 0x89;  // FIN=1, opcode=9 (ping)
+    ping_frame[1] = 0x00;  // 无payload，无mask
+    
+    int ret = mbedtls_ssl_write(ssl, ping_frame, 2);
+    if (ret <= 0) {
+        printf("发送ping帧失败: %d\n", ret);
+        return -1;
+    }
+    
+    printf("已发送心跳ping\n");
+    return 0;
 }
 
 // 获取当前时间戳（微秒）
@@ -397,6 +420,7 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     struct pollfd fds[1];
     int ret;
     int data_received = 0;
+    time_t last_ping_time = time(NULL);
     
     printf("开始接收行情数据...\n");
     
@@ -404,6 +428,14 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     fds[0].events = POLLIN;
     
     while (g_running) {
+        // 检查是否需要发送心跳
+        time_t current_time = time(NULL);
+        if (current_time - last_ping_time >= PING_INTERVAL_SEC) {
+            if (send_websocket_ping(ssl) == 0) {
+                last_ping_time = current_time;
+            }
+        }
+        
         // 等待数据，超时1秒
         ret = poll(fds, 1, 1000);
         
@@ -446,6 +478,8 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
             
             if (frame_len > 0) {
                 process_ticker_data(payload, payload_len);
+            } else if (frame_len == 2) {
+                // pong帧已在parse_websocket_frame中处理
             }
         }
         

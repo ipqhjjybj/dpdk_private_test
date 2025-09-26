@@ -1,4 +1,4 @@
- /**
+/**
  * 轻量级币安WebSocket行情客户端 (C语言版本)
  * 使用标准socket + mbedTLS实现
  * 功能：接收BTC/USDT实时行情数据
@@ -396,6 +396,7 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
     unsigned char buffer[BUFFER_SIZE];
     struct pollfd fds[1];
     int ret;
+    int data_received = 0;
     
     printf("开始接收行情数据...\n");
     
@@ -424,9 +425,19 @@ void run_client_loop(mbedtls_ssl_context *ssl, int sockfd) {
                 if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
                     continue;
                 }
-                printf("读取数据失败: %d\n", ret);
+                char error_buf[100];
+                mbedtls_strerror(ret, error_buf, sizeof(error_buf));
+                printf("读取数据失败: %d (%s)\n", ret, error_buf);
+                if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                    printf("服务器主动关闭了SSL连接\n");
+                } else if (ret == MBEDTLS_ERR_NET_CONN_RESET) {
+                    printf("网络连接被重置\n");
+                }
+                printf("已接收数据包数量: %d\n", data_received);
                 break;
             }
+            
+            data_received++;
             
             // 解析WebSocket帧
             unsigned char *payload;
@@ -454,6 +465,8 @@ void cleanup_ssl(mbedtls_ssl_context *ssl) {
 int main() {
     int sockfd = -1;
     mbedtls_ssl_context ssl;
+    int reconnect_count = 0;
+    const int max_reconnects = 10;
     
     printf("轻量级币安WebSocket客户端 (C语言版本)\n");
     printf("=======================================\n");
@@ -462,33 +475,64 @@ int main() {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    // 1. 创建TCP连接
-    sockfd = create_socket_connection();
-    if (sockfd < 0) {
-        return 1;
-    }
-    
-    // 2. 执行SSL握手
-    if (perform_ssl_handshake(&ssl, sockfd) < 0) {
-        close(sockfd);
-        return 1;
-    }
-    
-    // 3. 执行WebSocket握手
-    if (perform_websocket_handshake(&ssl) < 0) {
+    while (g_running && reconnect_count < max_reconnects) {
+        printf("\n=== 连接尝试 %d/%d ===\n", reconnect_count + 1, max_reconnects);
+        
+        // 1. 创建TCP连接
+        sockfd = create_socket_connection();
+        if (sockfd < 0) {
+            reconnect_count++;
+            printf("等待5秒后重试...\n");
+            sleep(5);
+            continue;
+        }
+        
+        // 2. 执行SSL握手
+        if (perform_ssl_handshake(&ssl, sockfd) < 0) {
+            close(sockfd);
+            reconnect_count++;
+            printf("等待5秒后重试...\n");
+            sleep(5);
+            continue;
+        }
+        
+        // 3. 执行WebSocket握手
+        if (perform_websocket_handshake(&ssl) < 0) {
+            cleanup_ssl(&ssl);
+            close(sockfd);
+            reconnect_count++;
+            printf("等待5秒后重试...\n");
+            sleep(5);
+            continue;
+        }
+        
+        printf("连接成功! 开始接收数据...\n");
+        
+        // 4. 运行主循环
+        run_client_loop(&ssl, sockfd);
+        
+        // 5. 清理资源
+        printf("连接断开，正在清理资源...\n");
         cleanup_ssl(&ssl);
         close(sockfd);
-        return 1;
+        
+        // 如果是用户主动退出，不重连
+        if (!g_running) {
+            break;
+        }
+        
+        reconnect_count++;
+        if (reconnect_count < max_reconnects) {
+            printf("等待5秒后重新连接...\n");
+            sleep(5);
+        }
     }
     
-    // 4. 运行主循环
-    run_client_loop(&ssl, sockfd);
+    if (reconnect_count >= max_reconnects) {
+        printf("已达到最大重连次数 (%d)，程序退出\n", max_reconnects);
+    } else {
+        printf("程序正常退出\n");
+    }
     
-    // 5. 清理资源
-    printf("正在清理资源...\n");
-    cleanup_ssl(&ssl);
-    close(sockfd);
-    
-    printf("程序退出\n");
     return 0;
 }

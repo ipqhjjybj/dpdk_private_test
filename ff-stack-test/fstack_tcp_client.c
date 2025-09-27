@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 // F-Stack头文件
 #include "ff_config.h"
@@ -23,6 +25,18 @@ int epfd = -1;
 struct epoll_event ev, events[MAX_EVENTS];
 const char *server_ip;
 const char *send_data = "Hello from F-Stack TCP client!";
+
+// 获取当前时间戳（毫秒）
+static uint64_t ff_get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// F-Stack清理函数声明
+void ff_cleanup(void){
+    
+}
 
 // 事件处理函数
 static int handle_events(void *arg) {
@@ -204,13 +218,12 @@ int main(int argc, char *argv[]) {
     }
 
     // 运行主循环
-    ret = ff_run(main_loop, NULL);
+    ff_run(main_loop, NULL);
 
     // 清理资源
     ff_close(sockfd);
     ff_close(epfd);
     ff_cleanup();
-    
-    return ret;
+
+    return 0;
 }
-    

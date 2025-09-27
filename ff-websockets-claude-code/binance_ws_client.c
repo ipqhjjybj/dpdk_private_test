@@ -18,14 +18,6 @@
  #include "ff_api.h"
  #include "ff_epoll.h"
  
- // 定义兼容的地址结构体
- struct linux_sockaddr_in {
-     short sin_family;
-     unsigned short sin_port;
-     struct in_addr sin_addr;
-     char sin_zero[8];
- };
- 
  // mbedTLS 头文件
  #include "mbedtls/net_sockets.h"
  #include "mbedtls/ssl.h"
@@ -264,7 +256,7 @@
      }
      
      // 连接到币安服务器
-     struct linux_sockaddr_in server_addr;
+     struct sockaddr_in server_addr;
      memset(&server_addr, 0, sizeof(server_addr));
      server_addr.sin_family = AF_INET;
      server_addr.sin_port = htons(BINANCE_PORT);
@@ -276,7 +268,7 @@
      }
      
      printf("正在连接到 %s:%d...\n", BINANCE_HOST, BINANCE_PORT);
-     if (ff_connect(sockfd, (struct linux_sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+     if (ff_connect(sockfd, (const struct linux_sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
          printf("连接失败: %d\n", errno);
          goto cleanup;
      }

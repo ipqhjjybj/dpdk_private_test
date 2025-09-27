@@ -1,15 +1,28 @@
 CC = gcc
-CFLAGS = -Wall -O2 -I/opt/fstack/include -I/opt/fstack/dpdk/include
-LDFLAGS = -L/opt/fstack/lib -L/opt/fstack/dpdk/lib
-LDLIBS = -lfs -ldpdk -lnuma -lpthread -ldl
 
-TARGET = fstack_tcp_client
-SRCS = fstack_tcp_client.c
+TOPDIR=/home/ubuntu/git/f-stack
 
-all: $(TARGET)
+ifeq ($(FF_PATH),)
+	FF_PATH=${TOPDIR}
+endif
 
-$(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS) $(LDLIBS)
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+$(error "No installation of DPDK found, maybe you should export environment variable `PKG_CONFIG_PATH`")
+endif
 
+PKGCONF ?= pkg-config
+
+CFLAGS += -O0 -g -gdwarf-2 $(shell $(PKGCONF) --cflags libdpdk)
+
+LIBS+= $(shell $(PKGCONF) --static --libs libdpdk)
+LIBS+= -L${FF_PATH}/lib -Wl,--whole-archive,-lfstack,--no-whole-archive
+LIBS+= -Wl,--no-whole-archive -lrt -lm -ldl -lcrypto -pthread -lnuma
+
+
+TARGET="fstack_tcp_client"
+all:
+	cc ${CFLAGS} -DINET6 -o ${TARGET} fstack_tcp_client.c ${LIBS}
+
+.PHONY: clean
 clean:
-	rm -f $(TARGET)
+	rm -f *.o ${TARGET} ${TARGET}_epoll

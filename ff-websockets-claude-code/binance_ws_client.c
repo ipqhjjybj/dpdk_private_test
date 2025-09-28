@@ -408,8 +408,6 @@
      // 初始化F-Stack
      printf("正在初始化F-Stack...\n");
 
-     // 设置 F-Stack 配置文件路径（必须在 ff_init 前设置）
-     setenv("FF_CONF", "./ff.conf", 1);
      if (ff_init(argc, argv) < 0) {
          fprintf(stderr, "F-Stack初始化失败！可能原因：PCI地址错误/大页未分配/核心绑定冲突\n");
          return -1;

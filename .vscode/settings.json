@@ -1,6 +1,22 @@
 {
     "files.associations": {
         "errno.h": "c",
-        "inet.h": "c"
+        "inet.h": "c",
+        "istream": "c",
+        "__config": "c",
+        "__hash_table": "c",
+        "__locale": "c",
+        "forward_list": "c",
+        "sstream": "c",
+        "string": "c",
+        "vector": "c",
+        "ostream": "c",
+        "print": "c",
+        "string.h": "c",
+        "types.h": "c",
+        "iostream": "cpp",
+        "cstring": "cpp",
+        "socket.h": "c",
+        "netdb.h": "c"
     }
 }

@@ -1,6 +1,6 @@
 CC = gcc
 
-TOPDIR=/home/ubuntu/git/f-stack
+TOPDIR=/data/f-stack
 
 ifeq ($(FF_PATH),)
 	FF_PATH=${TOPDIR}

@@ -1,6 +1,6 @@
 import socket
 
-def start_client(host='127.0.0.1', port=8080):
+def start_client(host='54.92.125.174', port=9443):
     """启动Socket客户端"""
     # 创建TCP socket对象
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

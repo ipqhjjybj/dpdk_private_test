@@ -51,11 +51,15 @@ typedef struct {
     time_t last_ping_time;
     int running;
     FILE *latency_file;
+    FILE *kernel_latency_file;
     int reconnect_attempts;
     long long message_count;
     long long total_latency_us;
     int min_latency_us;
     int max_latency_us;
+    long long total_kernel_latency_us;
+    int min_kernel_latency_us;
+    int max_kernel_latency_us;
     char payload_buffer[MAX_PAYLOAD_SIZE];
     time_t last_ping_check;
 } tls_context_t;
@@ -65,6 +69,9 @@ typedef struct {
     long long id;
     int latency_us;
 } depth_update_t;
+
+// 函数声明
+int mbedtls_net_recv_with_timestamp(void *ctx_void, unsigned char *buf, size_t len);
 
 // 获取当前时间戳（微秒）
 long long get_timestamp_us() {
@@ -239,11 +246,15 @@ int init_tls_context(tls_context_t *ctx) {
     ctx->last_ping_time = 0;
     ctx->running = 0;
     ctx->latency_file = NULL;
+    ctx->kernel_latency_file = NULL;
     ctx->reconnect_attempts = 0;
     ctx->message_count = 0;
     ctx->total_latency_us = 0;
     ctx->min_latency_us = INT_MAX;
     ctx->max_latency_us = 0;
+    ctx->total_kernel_latency_us = 0;
+    ctx->min_kernel_latency_us = INT_MAX;
+    ctx->max_kernel_latency_us = 0;
     ctx->last_ping_check = 0;
 
     return 0;
@@ -261,7 +272,8 @@ int connect_to_binance(tls_context_t *ctx) {
         return ret;
     }
 
-    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+    // 使用自定义接收函数以获取内核时间戳
+    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd, mbedtls_net_send, mbedtls_net_recv_with_timestamp, NULL);
 
     printf("Performing SSL handshake...\n");
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
@@ -272,6 +284,16 @@ int connect_to_binance(tls_context_t *ctx) {
     }
 
     printf("SSL handshake completed\n");
+
+    // 启用 SO_TIMESTAMP 以获取内核时间戳
+    int enable = 1;
+    int sock_fd = ctx->server_fd.fd;
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_TIMESTAMP, &enable, sizeof(enable)) < 0) {
+        printf("Warning: Failed to enable SO_TIMESTAMP: %s\n", strerror(errno));
+    } else {
+        printf("SO_TIMESTAMP enabled for kernel timestamping\n");
+    }
+
     return 0;
 }
 
@@ -454,6 +476,56 @@ static inline void extract_trade_data_fast(const char *payload, int payload_len,
     }
 }
 
+// 自定义 mbedtls 接收函数，获取内核时间戳
+// 这个函数会被 mbedtls 用作底层接收函数
+int mbedtls_net_recv_with_timestamp(void *ctx_void, unsigned char *buf, size_t len) {
+    mbedtls_net_context *ctx = (mbedtls_net_context *)ctx_void;
+    int fd = ctx->fd;
+
+    struct msghdr msg;
+    struct iovec iov;
+    char ctrl_buf[CMSG_SPACE(sizeof(struct timeval))];
+
+    memset(&msg, 0, sizeof(msg));
+    memset(ctrl_buf, 0, sizeof(ctrl_buf));
+
+    iov.iov_base = buf;
+    iov.iov_len = len;
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl_buf;
+    msg.msg_controllen = sizeof(ctrl_buf);
+
+    int ret = recvmsg(fd, &msg, 0);
+
+    if (ret > 0) {
+        // 提取内核时间戳并保存到全局变量（稍后会改进）
+        struct cmsghdr *cmsg;
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP) {
+                // 保存到全局变量供后续使用
+                extern struct timeval g_last_kernel_timestamp;
+                struct timeval *tv = (struct timeval *)CMSG_DATA(cmsg);
+                g_last_kernel_timestamp = *tv;
+                break;
+            }
+        }
+    }
+
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        return -1;
+    }
+
+    return ret;
+}
+
+// 全局变量保存最后一次内核时间戳
+struct timeval g_last_kernel_timestamp = {0, 0};
+
 // 主循环：接收和处理trade数据
 void receive_trade_updates(tls_context_t *ctx) {
     static unsigned char buffer[BUFFER_SIZE]; // 静态分配，避免栈开销
@@ -463,6 +535,7 @@ void receive_trade_updates(tls_context_t *ctx) {
     int opcode;
     int ret;
     depth_update_t update;
+    long long kernel_time_us = 0;
 
     printf("Trade data stream started...\n");
     time_t start_time = time(NULL);
@@ -481,8 +554,16 @@ void receive_trade_updates(tls_context_t *ctx) {
             }
         }
 
-        // 读取新数据到buffer尾部
+        // 读取新数据到buffer尾部（mbedtls_ssl_read 内部会调用我们的自定义接收函数）
         ret = mbedtls_ssl_read(&ctx->ssl, buffer + buffer_used, sizeof(buffer) - buffer_used);
+
+        // 获取内核时间戳（从全局变量读取）
+        extern struct timeval g_last_kernel_timestamp;
+        if (g_last_kernel_timestamp.tv_sec > 0) {
+            kernel_time_us = (long long)g_last_kernel_timestamp.tv_sec * 1000000 +
+                            g_last_kernel_timestamp.tv_usec;
+        }
+
         if (ret < 0) {
             if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
                 continue;
@@ -524,7 +605,7 @@ void receive_trade_updates(tls_context_t *ctx) {
                             break;
                         }
 
-                        // 立即获取时间戳
+                        // 立即获取应用层处理时间戳
                         long long current_time_us = get_timestamp_us();
 
                         // 一次性提取所有需要的数据
@@ -532,10 +613,12 @@ void receive_trade_updates(tls_context_t *ctx) {
                         extract_trade_data_fast(payload, payload_len, &trade_id, &event_timestamp);
 
                         int latency_us = -1;
+                        int kernel_latency_us = -1;
+
                         if (__builtin_expect(event_timestamp > 0, 1)) {
                             latency_us = (int)(current_time_us - event_timestamp * 1000);
 
-                            // 快速更新统计
+                            // 快速更新端到端延迟统计
                             ctx->total_latency_us += latency_us;
                             if (__builtin_expect(latency_us < ctx->min_latency_us, 0)) {
                                 ctx->min_latency_us = latency_us;
@@ -545,9 +628,23 @@ void receive_trade_updates(tls_context_t *ctx) {
                             }
                         }
 
+                        // 计算内核到应用层的延迟（网卡到应用程序）
+                        if (__builtin_expect(kernel_time_us > 0, 1)) {
+                            kernel_latency_us = (int)(current_time_us - kernel_time_us);
+
+                            // 更新内核延迟统计
+                            ctx->total_kernel_latency_us += kernel_latency_us;
+                            if (__builtin_expect(kernel_latency_us < ctx->min_kernel_latency_us, 0)) {
+                                ctx->min_kernel_latency_us = kernel_latency_us;
+                            }
+                            if (__builtin_expect(kernel_latency_us > ctx->max_kernel_latency_us, 0)) {
+                                ctx->max_kernel_latency_us = kernel_latency_us;
+                            }
+                        }
+
                         ctx->message_count++;
 
-                        // 批量写入文件
+                        // 批量写入端到端延迟文件
                         if (__builtin_expect(ctx->latency_file != NULL && latency_us >= 0, 1)) {
                             fprintf(ctx->latency_file, "%lld,%d\n", trade_id, latency_us);
                             if (__builtin_expect((ctx->message_count & 1023) == 0, 0)) { // 每1024条消息刷新
@@ -555,14 +652,26 @@ void receive_trade_updates(tls_context_t *ctx) {
                             }
                         }
 
+                        // 批量写入内核延迟文件
+                        if (__builtin_expect(ctx->kernel_latency_file != NULL && kernel_latency_us >= 0, 1)) {
+                            fprintf(ctx->kernel_latency_file, "%lld,%d\n", trade_id, kernel_latency_us);
+                            if (__builtin_expect((ctx->message_count & 1023) == 0, 0)) {
+                                fflush(ctx->kernel_latency_file);
+                            }
+                        }
+
                         // 每1000条消息的统计输出
                         if (__builtin_expect((ctx->message_count % 1000) == 0, 0)) {
                             const char* symbol = get_symbol_for_stats();
                             int avg_latency = (int)(ctx->total_latency_us / ctx->message_count);
+                            int avg_kernel_latency = ctx->total_kernel_latency_us > 0 ?
+                                (int)(ctx->total_kernel_latency_us / ctx->message_count) : 0;
 
-                            printf("[%lld] %s trades | Avg: %d us | Min: %d us | Max: %d us | Latest: %lld\n",
+                            printf("[%lld] %s trades | E2E: %d us (Min: %d, Max: %d) | Kernel: %d us (Min: %d, Max: %d) | ID: %lld\n",
                                    ctx->message_count, symbol, avg_latency,
-                                   ctx->min_latency_us, ctx->max_latency_us, trade_id);
+                                   ctx->min_latency_us, ctx->max_latency_us,
+                                   avg_kernel_latency, ctx->min_kernel_latency_us, ctx->max_kernel_latency_us,
+                                   trade_id);
                         }
                     }
                     break;
@@ -643,6 +752,11 @@ void cleanup_tls_context(tls_context_t *ctx) {
         fclose(ctx->latency_file);
         ctx->latency_file = NULL;
     }
+
+    if (ctx->kernel_latency_file != NULL) {
+        fclose(ctx->kernel_latency_file);
+        ctx->kernel_latency_file = NULL;
+    }
 }
 
 int main() {
@@ -671,10 +785,21 @@ int main() {
     if (ctx.latency_file == NULL) {
         printf("Warning: Failed to open latency.txt for writing\n");
     } else {
-        printf("Latency data will be logged to latency.txt\n");
+        printf("End-to-end latency data will be logged to latency.txt\n");
         // 写入表头
         fprintf(ctx.latency_file, "trade_id,latency_us\n");
         fflush(ctx.latency_file);
+    }
+
+    // 打开内核延迟记录文件
+    ctx.kernel_latency_file = fopen("kernel_latency.txt", "w");
+    if (ctx.kernel_latency_file == NULL) {
+        printf("Warning: Failed to open kernel_latency.txt for writing\n");
+    } else {
+        printf("Kernel-to-application latency data will be logged to kernel_latency.txt\n");
+        // 写入表头
+        fprintf(ctx.kernel_latency_file, "trade_id,kernel_latency_us\n");
+        fflush(ctx.kernel_latency_file);
     }
 
     // 主循环：连接 -> 运行 -> 重连

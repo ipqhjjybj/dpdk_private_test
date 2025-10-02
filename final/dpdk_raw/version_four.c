@@ -84,7 +84,9 @@
  typedef enum {
      TLS_INIT = 0,
      TLS_HANDSHAKING,
-     TLS_CONNECTED
+     TLS_CONNECTED,
+     WS_HANDSHAKE_SENT,
+     WS_CONNECTED
  } tls_state_t;
  
  // 连接上下文（单连接优化）
@@ -470,38 +472,6 @@
          return -1;
      }
  
-     printf("DEBUG: 已发送TCP包\n");
-     printf("  flags=0x%02x seq=%u ack=%u len=%u\n",
-            flags, rte_be_to_cpu_32(tcp_hdr->sent_seq), rte_be_to_cpu_32(tcp_hdr->recv_ack), payload_len);
-     printf("  src=%u.%u.%u.%u:%u\n",
-            (ntohl(conn_ctx->local_ip) >> 24) & 0xFF,
-            (ntohl(conn_ctx->local_ip) >> 16) & 0xFF,
-            (ntohl(conn_ctx->local_ip) >> 8) & 0xFF,
-            ntohl(conn_ctx->local_ip) & 0xFF,
-            conn_ctx->local_port);
-     printf("  dst=%u.%u.%u.%u:%u\n",
-            (ntohl(conn_ctx->remote_ip) >> 24) & 0xFF,
-            (ntohl(conn_ctx->remote_ip) >> 16) & 0xFF,
-            (ntohl(conn_ctx->remote_ip) >> 8) & 0xFF,
-            ntohl(conn_ctx->remote_ip) & 0xFF,
-            conn_ctx->remote_port);
-     printf("  src_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            eth_hdr->src_addr.addr_bytes[0],
-            eth_hdr->src_addr.addr_bytes[1],
-            eth_hdr->src_addr.addr_bytes[2],
-            eth_hdr->src_addr.addr_bytes[3],
-            eth_hdr->src_addr.addr_bytes[4],
-            eth_hdr->src_addr.addr_bytes[5]);
-     printf("  dst_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            conn_ctx->remote_mac.addr_bytes[0],
-            conn_ctx->remote_mac.addr_bytes[1],
-            conn_ctx->remote_mac.addr_bytes[2],
-            conn_ctx->remote_mac.addr_bytes[3],
-            conn_ctx->remote_mac.addr_bytes[4],
-            conn_ctx->remote_mac.addr_bytes[5]);
-     printf("  IP checksum=0x%04x, TCP checksum=0x%04x\n",
-            rte_be_to_cpu_16(ip_hdr->hdr_checksum),
-            rte_be_to_cpu_16(tcp_hdr->cksum));
  
      return 0;
  }
@@ -570,9 +540,11 @@
                     ((tcp_hdr->data_off >> 4) * 4);
  
      // 状态机处理
+ 
      switch (conn_ctx->tcp_state) {
          case TCP_SYN_SENT:
              if (flags & RTE_TCP_SYN_FLAG && flags & RTE_TCP_ACK_FLAG) {
+                 printf("收到SYN-ACK！\n");
                  conn_ctx->ack_num = seq + 1;
                  conn_ctx->tcp_state = TCP_ESTABLISHED;
                  send_tcp_packet(RTE_TCP_ACK_FLAG, NULL, 0);
@@ -581,11 +553,31 @@
                  // 开始TLS握手
                  conn_ctx->tls_state = TLS_HANDSHAKING;
                  mbedtls_ssl_handshake(&conn_ctx->ssl);
+             } else if (flags & RTE_TCP_ACK_FLAG) {
+                 // 收到纯ACK或其他包，说明服务器认为连接已存在
+                 // 发送RST重置连接
+                 printf("WARNING: TCP_SYN_SENT状态收到ACK (flags=0x%02x)，发送RST重置连接\n", flags);
+                 conn_ctx->seq_num = ack;  // 使用对方的ACK作为我们的SEQ
+                 send_tcp_packet(RTE_TCP_RST_FLAG, NULL, 0);
+ 
+                 // 重新发送SYN
+                 conn_ctx->seq_num = conn_ctx->init_seq;
+                 send_tcp_packet(RTE_TCP_SYN_FLAG, NULL, 0);
+                 conn_ctx->seq_num++;
+                 printf("已重新发送SYN\n");
+             } else {
+                 printf("WARNING: TCP_SYN_SENT状态收到未知包，flags=0x%02x\n", flags);
              }
              break;
  
          case TCP_ESTABLISHED:
              if (tcp_data_len > 0) {
+                 // 检查是否是新数据（避免处理重复包）
+                 if (seq != conn_ctx->ack_num) {
+                     printf("DEBUG: 跳过旧数据或重复包 seq=%u, expected=%u\n", seq, conn_ctx->ack_num);
+                     break;
+                 }
+ 
                  // 数据包 - 添加到接收缓冲区
                  if (conn_ctx->rx_buffer_len + tcp_data_len < sizeof(conn_ctx->rx_buffer)) {
                      rte_memcpy(conn_ctx->rx_buffer + conn_ctx->rx_buffer_len,
@@ -594,12 +586,17 @@
                      conn_ctx->ack_num = seq + tcp_data_len;
                      send_tcp_packet(RTE_TCP_ACK_FLAG, NULL, 0);
  
+                     // 如果TLS还没开始，启动TLS握手
+                     if (conn_ctx->tls_state == TLS_INIT) {
+                         printf("启动TLS握手...\n");
+                         conn_ctx->tls_state = TLS_HANDSHAKING;
+                     }
+ 
                      // TLS解密处理
                      if (conn_ctx->tls_state == TLS_HANDSHAKING) {
                          int ret = mbedtls_ssl_handshake(&conn_ctx->ssl);
                          if (ret == 0) {
-                             printf("TLS握手完成\n");
-                             conn_ctx->tls_state = TLS_CONNECTED;
+                             printf("✓ TLS握手完成\n");
  
                              // 发送WebSocket握手请求
                              const char *ws_handshake =
@@ -615,12 +612,39 @@
                                                            (unsigned char *)ws_handshake,
                                                            strlen(ws_handshake));
                              if (ws_ret > 0) {
-                                 printf("WebSocket握手请求已发送 (%d字节)\n", ws_ret);
+                                 printf("✓ WebSocket握手请求已发送 (%d字节)\n", ws_ret);
+                                 conn_ctx->tls_state = WS_HANDSHAKE_SENT;
                              } else {
-                                 printf("WebSocket握手发送失败\n");
+                                 printf("✗ WebSocket握手发送失败: %d\n", ws_ret);
+                             }
+                         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                             char error_buf[100];
+                             mbedtls_strerror(ret, error_buf, sizeof(error_buf));
+                             printf("✗ TLS握手错误: -0x%04x (%s)\n", -ret, error_buf);
+                         }
+                     } else if (conn_ctx->tls_state == WS_HANDSHAKE_SENT) {
+                         // 读取WebSocket握手响应
+                         unsigned char response[4096];
+                         int ret = mbedtls_ssl_read(&conn_ctx->ssl, response, sizeof(response));
+                         if (ret > 0) {
+                             // 查找HTTP响应头结束标记 \r\n\r\n
+                             for (int i = 0; i < ret - 3; i++) {
+                                 if (response[i] == '\r' && response[i+1] == '\n' &&
+                                     response[i+2] == '\r' && response[i+3] == '\n') {
+                                     printf("✓ WebSocket握手完成\n");
+                                     conn_ctx->tls_state = WS_CONNECTED;
+ 
+                                     // 如果响应后还有数据，需要处理
+                                     int remaining = ret - (i + 4);
+                                     if (remaining > 0) {
+                                         rte_memcpy(conn_ctx->ws_buffer, response + i + 4, remaining);
+                                         conn_ctx->ws_buffer_len = remaining;
+                                     }
+                                     break;
+                                 }
                              }
                          }
-                     } else if (conn_ctx->tls_state == TLS_CONNECTED) {
+                     } else if (conn_ctx->tls_state == WS_CONNECTED) {
                          // 读取解密后的数据
                          unsigned char decrypted[4096];
                          int ret = mbedtls_ssl_read(&conn_ctx->ssl, decrypted, sizeof(decrypted));
@@ -631,19 +655,29 @@
                                            decrypted, ret);
                                  conn_ctx->ws_buffer_len += ret;
  
-                                 // 解析WebSocket帧
-                                 unsigned char *payload;
-                                 int payload_len, opcode;
-                                 while (parse_websocket_frame(conn_ctx->ws_buffer,
-                                                             conn_ctx->ws_buffer_len,
-                                                             &payload, &payload_len, &opcode) > 0) {
-                                     if (opcode == WS_OPCODE_TEXT) {
-                                         process_trade_data(payload, payload_len, hw_ts);
-                                     } else if (opcode == WS_OPCODE_PING) {
-                                         send_websocket_pong(payload, payload_len);
+                                 // 解析WebSocket帧（循环处理缓冲区中的所有帧）
+                                 while (conn_ctx->ws_buffer_len > 0) {
+                                     unsigned char *payload;
+                                     int payload_len, opcode;
+                                     int frame_size = parse_websocket_frame(conn_ctx->ws_buffer,
+                                                                 conn_ctx->ws_buffer_len,
+                                                                 &payload, &payload_len, &opcode);
+                                     if (frame_size > 0) {
+                                         if (opcode == WS_OPCODE_TEXT) {
+                                             process_trade_data(payload, payload_len, hw_ts);
+                                         } else if (opcode == WS_OPCODE_PING) {
+                                             send_websocket_pong(payload, payload_len);
+                                         }
+                                         // 移除已处理的帧，保留剩余数据
+                                         int remaining = conn_ctx->ws_buffer_len - frame_size;
+                                         if (remaining > 0) {
+                                             memmove(conn_ctx->ws_buffer, conn_ctx->ws_buffer + frame_size, remaining);
+                                         }
+                                         conn_ctx->ws_buffer_len = remaining;
+                                     } else {
+                                         // 帧不完整，等待更多数据
+                                         break;
                                      }
-                                     // 移除已处理的帧（简化处理）
-                                     conn_ctx->ws_buffer_len = 0;
                                  }
                              }
                          }
@@ -712,43 +746,8 @@
                          uint16_t dst_port = rte_be_to_cpu_16(tcp->dst_port);
                          uint16_t src_port = rte_be_to_cpu_16(tcp->src_port);
  
-                         // 检查是否是币安服务器的回复
-                         if (ip->src_addr == conn_ctx->remote_ip) {
-                             printf("=== 收到币安服务器的包！===\n");
-                             printf("    src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u flags=0x%02x\n",
-                                    (ntohl(ip->src_addr) >> 24) & 0xFF,
-                                    (ntohl(ip->src_addr) >> 16) & 0xFF,
-                                    (ntohl(ip->src_addr) >> 8) & 0xFF,
-                                    ntohl(ip->src_addr) & 0xFF,
-                                    src_port,
-                                    (ntohl(ip->dst_addr) >> 24) & 0xFF,
-                                    (ntohl(ip->dst_addr) >> 16) & 0xFF,
-                                    (ntohl(ip->dst_addr) >> 8) & 0xFF,
-                                    ntohl(ip->dst_addr) & 0xFF,
-                                    dst_port,
-                                    tcp->tcp_flags);
-                         }
- 
-                         // 打印端口8000或443的所有TCP包
-                         if (dst_port == 8000 || src_port == 443 || pkt_count <= 10) {
-                             printf("DEBUG: 收到TCP包 src=%u.%u.%u.%u:%u dst=%u.%u.%u.%u:%u flags=0x%02x\n",
-                                    (ntohl(ip->src_addr) >> 24) & 0xFF,
-                                    (ntohl(ip->src_addr) >> 16) & 0xFF,
-                                    (ntohl(ip->src_addr) >> 8) & 0xFF,
-                                    ntohl(ip->src_addr) & 0xFF,
-                                    src_port,
-                                    (ntohl(ip->dst_addr) >> 24) & 0xFF,
-                                    (ntohl(ip->dst_addr) >> 16) & 0xFF,
-                                    (ntohl(ip->dst_addr) >> 8) & 0xFF,
-                                    ntohl(ip->dst_addr) & 0xFF,
-                                    dst_port,
-                                    tcp->tcp_flags);
-                         }
- 
                          // 只处理发往本机的TCP包
                          if (ip->dst_addr == conn_ctx->local_ip) {
-                             printf("DEBUG: 匹配的TCP包！dst_port=%u flags=0x%02x\n",
-                                    dst_port, tcp->tcp_flags);
                              process_tcp_packet(m);
                          }
                      }
@@ -1038,8 +1037,8 @@
          update_latency_stats(latency_us, rx_latency_us);
      }
  
-     // 统计输出（每1000条）
-     if (latency_stats.count % 1000 == 0 && latency_stats.count > 0) {
+     // 统计输出（每10条）
+     if (latency_stats.count % 10 == 0 && latency_stats.count > 0) {
          double avg_latency = latency_stats.total_latency / latency_stats.count;
          double avg_rx_latency = latency_stats.total_rx_latency / latency_stats.count;
          printf("[%d] %s | ID: %lld | E2E: %.1fμs | RX: %.1fμs\n",
@@ -1129,4 +1128,3 @@
  static void send_websocket_pong(const unsigned char *payload, int len) {
      send_websocket_frame(WS_OPCODE_PONG, payload, len);
  }
- 

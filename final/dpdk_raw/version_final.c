@@ -62,7 +62,8 @@
 #define MAX_PKT_BURST 32
 
 // 网络配置
-#define BINANCE_SERVER_IP "54.64.217.188"
+//#define BINANCE_SERVER_IP "54.64.217.188"
+#define BINANCE_SERVER_IP "52.193.85.106"
 #define BINANCE_SERVER_PORT 443
 #define LOCAL_IP "172.35.33.174"
 #define LOCAL_PORT 8000
@@ -916,6 +917,16 @@ int main(int argc, char **argv) {
     // 获取MAC地址
     rte_eth_macaddr_get(port_id, &conn_ctx->local_mac);
 
+   // 打印DPDK端口信息
+   struct rte_eth_dev_info dev_info;
+   rte_eth_dev_info_get(port_id, &dev_info);
+   printf("=== DPDK端口信息 ===\n");
+   printf("端口ID: %u\n", port_id);
+   printf("驱动名称: %s\n", dev_info.driver_name);
+   printf("设备名称: %s\n", rte_dev_name(dev_info.device));
+   printf("网卡总数: %u\n", rte_eth_dev_count_avail());
+   printf("==================\n");
+
     // 初始化连接参数 (inet_pton返回网络字节序，需要转换)
     struct in_addr addr;
     inet_pton(AF_INET, LOCAL_IP, &addr);
@@ -1197,3 +1208,4 @@ static int send_websocket_frame(int opcode, const unsigned char *payload, int pa
 static void send_websocket_pong(const unsigned char *payload, int len) {
     send_websocket_frame(WS_OPCODE_PONG, payload, len);
 }
+

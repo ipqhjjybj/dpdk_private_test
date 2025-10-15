@@ -17,6 +17,8 @@
 #include <limits.h>
 #include <linux/errqueue.h>
 #include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 
 #include "mbedtls/net_sockets.h"
@@ -76,18 +78,51 @@ typedef struct {
 
 // 启用底层socket的硬件时间戳
 int enable_hardware_timestamp(int sockfd) {
+    // 首先尝试启用网卡硬件接收时间戳
+    struct ifreq ifr;
+    struct hwtstamp_config hwconfig;
+
+    memset(&ifr, 0, sizeof(ifr));
+    memset(&hwconfig, 0, sizeof(hwconfig));
+
+    // 获取socket绑定的网卡名称
+    // 对于已连接的socket，我们需要通过其他方式获取
+    // 这里先尝试常见的网卡名
+    const char* iface_names[] = {"enp39s0", "enp40s0", "eth0", "ens5"};
+    int hwts_configured = 0;
+
+    for (int i = 0; i < sizeof(iface_names)/sizeof(iface_names[0]); i++) {
+        strncpy(ifr.ifr_name, iface_names[i], IFNAMSIZ - 1);
+
+        hwconfig.tx_type = HWTSTAMP_TX_OFF;
+        hwconfig.rx_filter = HWTSTAMP_FILTER_ALL;
+
+        ifr.ifr_data = (char *)&hwconfig;
+
+        if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) == 0) {
+            printf("Hardware RX timestamping configured on %s\n", iface_names[i]);
+            hwts_configured = 1;
+            break;
+        }
+    }
+
+    if (!hwts_configured) {
+        printf("Warning: Could not configure hardware timestamping on network interface\n");
+    }
+
+    // 设置socket时间戳选项
     int flags = SOF_TIMESTAMPING_RX_HARDWARE |
                 SOF_TIMESTAMPING_RX_SOFTWARE |
                 SOF_TIMESTAMPING_SOFTWARE |
                 SOF_TIMESTAMPING_RAW_HARDWARE;
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) < 0) {
-        printf("Warning: Failed to enable hardware timestamping: %s\n", strerror(errno));
+        printf("Warning: Failed to enable socket timestamping: %s\n", strerror(errno));
         printf("Falling back to software timestamps\n");
         return -1;
     }
 
-    printf("Hardware timestamping enabled on socket fd=%d\n", sockfd);
+    printf("Socket timestamping flags enabled on fd=%d\n", sockfd);
     return 0;
 }
 
@@ -119,12 +154,14 @@ int extract_hardware_timestamp(struct msghdr *msg, long long *hw_timestamp_us) {
             // 优先使用硬件时间戳(ts[2])
             if (ts[2].tv_sec != 0 || ts[2].tv_nsec != 0) {
                 *hw_timestamp_us = timespec_to_us(&ts[2]);
+                //printf("2!!");
                 return 2; // 硬件时间戳
             }
 
             // 如果硬件时间戳不可用，使用软件时间戳(ts[0])
             if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
                 *hw_timestamp_us = timespec_to_us(&ts[0]);
+                //printf("1!!");
                 return 1; // 软件时间戳
             }
         }

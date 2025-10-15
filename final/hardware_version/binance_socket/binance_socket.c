@@ -15,6 +15,9 @@
 #include <sched.h>
 #include <stdint.h>
 #include <limits.h>
+#include <linux/errqueue.h>
+#include <linux/net_tstamp.h>
+#include <sys/ioctl.h>
 
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
@@ -24,7 +27,7 @@
 #include "mbedtls/base64.h"
 #include "mbedtls/x509_crt.h"
 
-#define BINANCE_WS_HOST "54.65.11.60"
+#define BINANCE_WS_HOST "fstream.binance.com"
 #define BINANCE_WS_PORT "443"
 #define BUFFER_SIZE 16384
 #define MAX_PAYLOAD_SIZE 8192
@@ -58,6 +61,11 @@ typedef struct {
     int max_latency_us;
     char payload_buffer[MAX_PAYLOAD_SIZE];
     time_t last_ping_check;
+    int hw_timestamp_enabled;  // 硬件时间戳是否启用
+    // 网卡到应用层延迟统计
+    long long total_nic_to_app_us;
+    int min_nic_to_app_us;
+    int max_nic_to_app_us;
 } tls_context_t;
 
 typedef struct {
@@ -66,11 +74,63 @@ typedef struct {
     int latency_us;
 } depth_update_t;
 
+// 启用底层socket的硬件时间戳
+int enable_hardware_timestamp(int sockfd) {
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                SOF_TIMESTAMPING_RX_SOFTWARE |
+                SOF_TIMESTAMPING_SOFTWARE |
+                SOF_TIMESTAMPING_RAW_HARDWARE;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) < 0) {
+        printf("Warning: Failed to enable hardware timestamping: %s\n", strerror(errno));
+        printf("Falling back to software timestamps\n");
+        return -1;
+    }
+
+    printf("Hardware timestamping enabled on socket fd=%d\n", sockfd);
+    return 0;
+}
+
 // 获取当前时间戳（微秒）
 long long get_timestamp_us() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
+// 从timespec转换为微秒
+static inline long long timespec_to_us(struct timespec *ts) {
+    return (long long)ts->tv_sec * 1000000 + ts->tv_nsec / 1000;
+}
+
+// 从msghdr辅助数据中提取硬件时间戳
+int extract_hardware_timestamp(struct msghdr *msg, long long *hw_timestamp_us) {
+    struct cmsghdr *cmsg;
+
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+            struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
+
+            // SO_TIMESTAMPING 返回3个时间戳:
+            // ts[0] = 软件时间戳
+            // ts[1] = (已弃用)
+            // ts[2] = 硬件时间戳
+
+            // 优先使用硬件时间戳(ts[2])
+            if (ts[2].tv_sec != 0 || ts[2].tv_nsec != 0) {
+                *hw_timestamp_us = timespec_to_us(&ts[2]);
+                return 2; // 硬件时间戳
+            }
+
+            // 如果硬件时间戳不可用，使用软件时间戳(ts[0])
+            if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
+                *hw_timestamp_us = timespec_to_us(&ts[0]);
+                return 1; // 软件时间戳
+            }
+        }
+    }
+
+    return 0; // 没有找到时间戳
 }
 
 // 计算延迟（使用服务器时间戳，精确到微秒）
@@ -82,6 +142,55 @@ int calculate_latency_from_server_us(long long server_timestamp_ms) {
     long long current_time_us = get_timestamp_us();
     long long server_timestamp_us = server_timestamp_ms * 1000; // 毫秒转微秒
     return (int)(current_time_us - server_timestamp_us);
+}
+
+// 全局变量存储最近收到的硬件时间戳
+static __thread long long g_last_hw_timestamp_us = 0;
+static __thread int g_last_hw_timestamp_valid = 0;
+
+// 自定义recv函数，用于捕获硬件时间戳
+int custom_mbedtls_recv(void *ctx, unsigned char *buf, size_t len) {
+    mbedtls_net_context *net_ctx = (mbedtls_net_context *)ctx;
+    int sockfd = net_ctx->fd;
+
+    struct iovec iov;
+    struct msghdr msg;
+    char control[512];
+
+    memset(&msg, 0, sizeof(msg));
+    memset(control, 0, sizeof(control));
+
+    iov.iov_base = buf;
+    iov.iov_len = len;
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t ret = recvmsg(sockfd, &msg, 0);
+
+    if (ret > 0) {
+        // 尝试提取硬件时间戳
+        long long hw_ts = 0;
+        int ts_type = extract_hardware_timestamp(&msg, &hw_ts);
+
+        if (ts_type > 0) {
+            g_last_hw_timestamp_us = hw_ts;
+            g_last_hw_timestamp_valid = 1;
+        } else {
+            g_last_hw_timestamp_valid = 0;
+        }
+    }
+
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        return -1;
+    }
+
+    return (int)ret;
 }
 
 // 生成WebSocket accept key
@@ -245,6 +354,10 @@ int init_tls_context(tls_context_t *ctx) {
     ctx->min_latency_us = INT_MAX;
     ctx->max_latency_us = 0;
     ctx->last_ping_check = 0;
+    ctx->hw_timestamp_enabled = 0;
+    ctx->total_nic_to_app_us = 0;
+    ctx->min_nic_to_app_us = INT_MAX;
+    ctx->max_nic_to_app_us = 0;
 
     return 0;
 }
@@ -261,7 +374,18 @@ int connect_to_binance(tls_context_t *ctx) {
         return ret;
     }
 
-    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+    // 尝试启用硬件时间戳
+    int sockfd = ctx->server_fd.fd;
+    if (enable_hardware_timestamp(sockfd) == 0) {
+        ctx->hw_timestamp_enabled = 1;
+        printf("Hardware timestamping successfully enabled\n");
+    } else {
+        ctx->hw_timestamp_enabled = 0;
+        printf("Using software timestamps (hardware timestamps not available)\n");
+    }
+
+    // 使用自定义recv函数来捕获硬件时间戳
+    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd, mbedtls_net_send, custom_mbedtls_recv, NULL);
 
     printf("Performing SSL handshake...\n");
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
@@ -470,6 +594,10 @@ void receive_trade_updates(tls_context_t *ctx) {
     ctx->last_ping_check = start_time;
     ctx->running = 1;
 
+    // 统计硬件时间戳使用情况
+    long long hw_timestamp_count = 0;
+    long long sw_timestamp_count = 0;
+
     while (ctx->running) {
         // 优化ping检查（减少time()系统调用）
         if (__builtin_expect((ctx->message_count & 4095) == 0, 0)) { // 每4096条消息检查一次
@@ -545,6 +673,20 @@ void receive_trade_updates(tls_context_t *ctx) {
                             }
                         }
 
+                        // 计算网卡到应用层的延迟
+                        if (g_last_hw_timestamp_valid) {
+                            int nic_to_app_us = (int)(current_time_us - g_last_hw_timestamp_us);
+                            if (nic_to_app_us >= 0 && nic_to_app_us < 1000000) { // 过滤异常值(>1秒)
+                                ctx->total_nic_to_app_us += nic_to_app_us;
+                                if (nic_to_app_us < ctx->min_nic_to_app_us) {
+                                    ctx->min_nic_to_app_us = nic_to_app_us;
+                                }
+                                if (nic_to_app_us > ctx->max_nic_to_app_us) {
+                                    ctx->max_nic_to_app_us = nic_to_app_us;
+                                }
+                            }
+                        }
+
                         ctx->message_count++;
 
                         // 批量写入文件
@@ -559,10 +701,20 @@ void receive_trade_updates(tls_context_t *ctx) {
                         if (__builtin_expect((ctx->message_count % 1000) == 0, 0)) {
                             const char* symbol = get_symbol_for_stats();
                             int avg_latency = (int)(ctx->total_latency_us / ctx->message_count);
+                            int avg_nic_to_app = ctx->total_nic_to_app_us > 0 ?
+                                (int)(ctx->total_nic_to_app_us / ctx->message_count) : 0;
 
-                            printf("[%lld] %s trades | Avg: %d us | Min: %d us | Max: %d us | Latest: %lld\n",
-                                   ctx->message_count, symbol, avg_latency,
-                                   ctx->min_latency_us, ctx->max_latency_us, trade_id);
+                            if (ctx->total_nic_to_app_us > 0) {
+                                printf("[%lld] %s trades | E2E: %d us (min:%d max:%d) | NIC->APP: %d us (min:%d max:%d) | Latest: %lld\n",
+                                       ctx->message_count, symbol, avg_latency,
+                                       ctx->min_latency_us, ctx->max_latency_us,
+                                       avg_nic_to_app, ctx->min_nic_to_app_us, ctx->max_nic_to_app_us,
+                                       trade_id);
+                            } else {
+                                printf("[%lld] %s trades | E2E: %d us (min:%d max:%d) | Latest: %lld\n",
+                                       ctx->message_count, symbol, avg_latency,
+                                       ctx->min_latency_us, ctx->max_latency_us, trade_id);
+                            }
                         }
                     }
                     break;

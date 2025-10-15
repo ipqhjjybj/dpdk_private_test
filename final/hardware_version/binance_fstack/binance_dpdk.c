@@ -620,7 +620,7 @@ int main(int argc, char * argv[])
     printf("订阅品种: BTCUSDT, ETHUSDT, BCHUSDT, XRPUSDT等200+个热门合约\n");
     printf("数据类型: Trade交易数据 (实时成交记录)\n");
     printf("连接方式: Combine Stream (单连接多品种高效订阅)\n");
-    printf("服务器IP: 固定IP 54.64.217.188 (跳过DNS解析)\n");
+    printf("服务器IP: 固定IP 54.250.121.96 (跳过DNS解析)\n");
     printf("数据解析: 仅提取交易ID和延迟信息 (精简高性能)\n");
     printf("延迟精度: 微秒级(μs) - 币安服务器时间戳 vs 本地接收时间\n");
     printf("统计指标: 平均延迟、最小/最大延迟、抖动范围\n");

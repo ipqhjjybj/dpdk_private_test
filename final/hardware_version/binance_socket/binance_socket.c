@@ -162,7 +162,7 @@ int extract_hardware_timestamp(struct msghdr *msg, long long *hw_timestamp_us) {
             if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
                 *hw_timestamp_us = timespec_to_us(&ts[0]);
                 //printf("1!!");
-                return 1; // 软件时间戳
+                return 0; // 软件时间戳
             }
         }
     }

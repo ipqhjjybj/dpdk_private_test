@@ -1,0 +1,1 @@
+sudo ./binance_ws_client -l 1

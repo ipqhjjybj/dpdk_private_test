@@ -17,6 +17,7 @@
         "iostream": "cpp",
         "cstring": "cpp",
         "socket.h": "c",
-        "netdb.h": "c"
+        "netdb.h": "c",
+        "sched.h": "c"
     }
 }

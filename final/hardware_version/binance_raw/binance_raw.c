@@ -215,11 +215,6 @@ int bind_to_cpu_core(int core_id) {
 // 函数前向声明
 static int send_tcp_packet(uint8_t flags, const uint8_t *payload, uint16_t payload_len);
 
-// 计算TCP校验和（使用DPDK内置函数）
-static inline uint16_t tcp_checksum(struct rte_ipv4_hdr *ip_hdr, struct rte_tcp_hdr *tcp_hdr) {
-    tcp_hdr->cksum = 0;
-    return rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
-}
 
 // 发送Gratuitous ARP（宣告自己的IP和MAC）
 static int send_gratuitous_arp(void) {
@@ -481,7 +476,7 @@ static int send_tcp_packet(uint8_t flags, const uint8_t *payload, uint16_t paylo
     ip_hdr->src_addr = conn_ctx->local_ip;
     ip_hdr->dst_addr = conn_ctx->remote_ip;
     ip_hdr->hdr_checksum = 0;
-    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+    // IP checksum 由硬件计算 (不需要软件计算)
 
     // 构造TCP头
     tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
@@ -492,7 +487,7 @@ static int send_tcp_packet(uint8_t flags, const uint8_t *payload, uint16_t paylo
     tcp_hdr->data_off = (5 << 4); // 20字节TCP头
     tcp_hdr->tcp_flags = flags;
     tcp_hdr->rx_win = rte_cpu_to_be_16(65535);
-    tcp_hdr->cksum = 0;
+    tcp_hdr->cksum = 0;  // TCP checksum 由硬件计算
     tcp_hdr->tcp_urp = 0;
 
     // 拷贝payload
@@ -501,15 +496,17 @@ static int send_tcp_packet(uint8_t flags, const uint8_t *payload, uint16_t paylo
         rte_memcpy(data, payload, payload_len);
         conn_ctx->seq_num += payload_len;
     }
-    //printf("[send_tcp_packet] pre tcp_checksum\n");
 
-    // 计算TCP校验和
-    tcp_hdr->cksum = tcp_checksum(ip_hdr, tcp_hdr);
-    //printf("[send_tcp_packet] after tcp_checksum\n");
     // 设置mbuf长度
     mbuf->data_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
                      sizeof(struct rte_tcp_hdr) + payload_len;
     mbuf->pkt_len = mbuf->data_len;
+
+    // 启用硬件 TX checksum offload
+    mbuf->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM;
+    mbuf->l2_len = sizeof(struct rte_ether_hdr);
+    mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
+    mbuf->l4_len = sizeof(struct rte_tcp_hdr);
     //printf("[send_tcp_packet] after mbuf->data_len:%d, pkt_len:%d\n", mbuf->data_len, mbuf->pkt_len);
     // 发送数据包 - 添加调试信息
     uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &mbuf, 1);
@@ -917,10 +914,20 @@ static int main_loop(__rte_unused void *arg) {
 static int port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
     struct rte_eth_conf port_conf = {
         .rxmode = {
+            .mq_mode = RTE_ETH_MQ_RX_NONE,
             .max_lro_pkt_size = RTE_ETHER_MAX_LEN,
+            // 启用 RX checksum offload（ENA 支持）
+            .offloads = RTE_ETH_RX_OFFLOAD_CHECKSUM |
+                       RTE_ETH_RX_OFFLOAD_IPV4_CKSUM |
+                       RTE_ETH_RX_OFFLOAD_TCP_CKSUM |
+                       RTE_ETH_RX_OFFLOAD_UDP_CKSUM,
         },
         .txmode = {
-            .offloads = 0,  // 禁用硬件校验和卸载（AF_PACKET不支持）
+            .mq_mode = RTE_ETH_MQ_TX_NONE,
+            // 启用 TX checksum offload（ENA 支持）
+            .offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
+                       RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
+                       RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
         },
     };
     struct rte_eth_dev_info dev_info;

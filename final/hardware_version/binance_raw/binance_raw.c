@@ -59,7 +59,7 @@
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
-#define MAX_PKT_BURST 32
+#define MAX_PKT_BURST 4096
 
 // 网络配置
 //#define BINANCE_SERVER_IP "54.64.217.188"
@@ -845,6 +845,22 @@ static int main_loop(__rte_unused void *arg) {
                     rte_mbuf_timestamp_t *ts_ptr = RTE_MBUF_DYNFIELD(m,
                         timestamp_dynfield_offset, rte_mbuf_timestamp_t *);
                     *ts_ptr = rx_timestamp_ns;
+                }
+
+                // 验证：尝试读取硬件时间戳（测试你的示例代码）
+                if (pkt_count <= 10 && timestamp_dynfield_offset >= 0 && timestamp_dynflag_offset >= 0) {
+                    // 检查时间戳有效标志位（类似 PKT_RX_TIMESTAMP）
+                    uint64_t dynflag_bit = (1ULL << timestamp_dynflag_offset);
+                    if (m->ol_flags & dynflag_bit) {
+                        // 读取动态字段中的时间戳（类似你的示例代码）
+                        rte_mbuf_timestamp_t *hw_ts = RTE_MBUF_DYNFIELD(m,
+                            timestamp_dynfield_offset, rte_mbuf_timestamp_t *);
+                        printf("[包#%lu] 硬件时间戳标志位已设置，读取到时间戳: %lu ns\n",
+                               pkt_count, *hw_ts);
+                    } else {
+                        printf("[包#%lu] 硬件时间戳标志位未设置 (ol_flags=0x%lx)，ENA驱动不支持自动填充\n",
+                               pkt_count, m->ol_flags);
+                    }
                 }
 
                 // 快速过滤：只处理发往本机的TCP包
